@@ -1,0 +1,55 @@
+name: Task or improvement
+description: Track cleanup, refactors, documentation, research, or non-bug work.
+title: "[Task]: "
+labels: ["task", "needs triage"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be accomplished?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - API behavior
+        - background processing
+        - model/dependency setup
+        - file handling
+        - Docker or deployment
+        - documentation
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is included, and what is intentionally out of scope?
+  - type: textarea
+    id: checklist
+    attributes:
+      label: Checklist
+      description: Break the work into concrete steps.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - low
+        - medium
+        - high
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      placeholder: Run the server path touched by the change and check logs, inputs, outputs, and failure behavior.
