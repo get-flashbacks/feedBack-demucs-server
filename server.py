@@ -154,6 +154,27 @@ def _normalized_language(language: str) -> str:
     return lang
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True if binding to `host` only accepts connections from this machine.
+
+    A literal string comparison against ("127.0.0.1", "localhost", "::1")
+    misses equally-valid loopback spellings: any address in 127.0.0.0/8
+    (not just .1), IPv6 loopback written without :: compression
+    (0:0:0:0:0:0:0:1), or a bracketed IPv6 literal ([::1]). Parse it
+    properly instead. "localhost" is treated as loopback by convention
+    (matching every other tool's behavior) without a DNS lookup, since
+    resolving it is unreliable/slow and it means loopback on any sane
+    system's /etc/hosts.
+    """
+    if host == "localhost":
+        return True
+    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False  # not a bare IP literal (0.0.0.0, a hostname, etc.) -> not loopback
+
+
 def _client_safe_error(e: Exception, where: str) -> str:
     """Log an unexpected exception in full, and return a version fit to hand a caller.
 
@@ -2672,7 +2693,7 @@ def main():
               f"entr{'y' if _pruned_at_startup == 1 else 'ies'} over the limit at startup")
     if API_KEY:
         print("  API key: enabled")
-    elif args.host not in ("127.0.0.1", "localhost", "::1"):
+    elif not _is_loopback_host(args.host):
         # Every endpoint — including GPU/CPU-heavy separation and job-status
         # routes — is reachable unauthenticated by anything that can reach
         # this host when no key is set. Loud by design: this is the single
