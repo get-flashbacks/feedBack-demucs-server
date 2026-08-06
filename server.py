@@ -95,7 +95,10 @@ MAX_CONCURRENT = 2
 # body size, these endpoints have no auth requirement unless an operator sets an API key,
 # and this server is routinely exposed on a LAN — so a single oversized POST can OOM the
 # process. Cap it and reject anything larger with 413 rather than buffering it.
-MAX_UPLOAD_MB = int(os.environ.get("SLOPSMITH_MAX_UPLOAD_MB", "300"))
+try:
+    MAX_UPLOAD_MB = max(1, int(os.environ.get("SLOPSMITH_MAX_UPLOAD_MB", "300")))
+except (TypeError, ValueError):
+    MAX_UPLOAD_MB = 300
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 
