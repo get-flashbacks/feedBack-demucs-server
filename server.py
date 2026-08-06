@@ -83,6 +83,15 @@ def _parse_cache_max_completed_jobs(value: str | None) -> int:
 DEMUCS_MODEL = os.environ.get("SLOPSMITH_DEMUCS_MODEL", "htdemucs_ft")
 DEMUCS_DEVICE = os.environ.get("SLOPSMITH_DEMUCS_DEVICE", "")
 API_KEY = os.environ.get("SLOPSMITH_API_KEY", "")
+# Origins allowed to read responses from a browser (CORS is a browser-enforced,
+# response-blocking control — it doesn't stop a raw server-to-server request).
+# Left at "*" by default because a self-hosted feedBack instance's own origin is
+# not knowable ahead of time (arbitrary LAN IP/hostname, arbitrary port) — the
+# same reasoning SLOPSMITH_API_KEY defaults empty for. Operators who want this
+# locked to their known feedBack origin(s) can set a comma-separated list here.
+CORS_ORIGINS = [
+    o.strip() for o in os.environ.get("SLOPSMITH_CORS_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
 CACHE_DIR = Path(os.environ.get(
     "SLOPSMITH_DEMUCS_CACHE",
     Path.home() / ".cache" / "slopsmith-demucs",
@@ -323,7 +332,7 @@ def _job_id_for(audio_hash: str, model: str) -> str:
 app = FastAPI(title="Slopsmith Demucs Server")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1385,7 +1394,7 @@ async def align_lyrics(
             # their own mistakes from server faults.
             return {"error": str(e), "_http_status": 400}
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": _client_safe_error(e, "align")}
         finally:
             try:
                 os.unlink(tmp.name)
@@ -1833,7 +1842,7 @@ async def pitch_extract(
         try:
             return {"notes": _extract_pitch_with_crepe(Path(tmp.name), token_list)}
         except Exception as exc:  # noqa: BLE001
-            return {"error": str(exc)}
+            return {"error": _client_safe_error(exc, "pitch")}
         finally:
             try:
                 os.unlink(tmp.name)
@@ -2265,7 +2274,7 @@ def _run_demucs(job_id, audio_path, stem_list, model):
         proc.kill()
         _update_job(job_id, status="failed", error="Separation timed out (10 min limit)")
     except Exception as e:
-        _update_job(job_id, status="failed", error=str(e))
+        _update_job(job_id, status="failed", error=_client_safe_error(e, "separate (demucs)"))
     finally:
         with active_lock:
             active_count -= 1
@@ -2377,7 +2386,7 @@ def _run_roformer(job_id, audio_path, stem_list, model):
             proc.kill()
         _update_job(job_id, status="failed", error="Separation timed out (30 min limit)")
     except Exception as e:
-        _update_job(job_id, status="failed", error=str(e))
+        _update_job(job_id, status="failed", error=_client_safe_error(e, "separate (roformer)"))
     finally:
         with active_lock:
             active_count -= 1
@@ -2663,6 +2672,20 @@ def main():
               f"entr{'y' if _pruned_at_startup == 1 else 'ies'} over the limit at startup")
     if API_KEY:
         print("  API key: enabled")
+    elif args.host not in ("127.0.0.1", "localhost", "::1"):
+        # Every endpoint — including GPU/CPU-heavy separation and job-status
+        # routes — is reachable unauthenticated by anything that can reach
+        # this host when no key is set. Loud by design: this is the single
+        # highest-impact misconfiguration for this server, and it's silent
+        # otherwise (see feedBack-demucs-server issue "No auth by default
+        # on GPU/CPU-heavy endpoints").
+        print(f"  WARNING: no API key configured and server is bound to "
+              f"{args.host} (not loopback-only) — every endpoint is reachable "
+              f"unauthenticated by anything that can reach this host. Set "
+              f"--api-key or SLOPSMITH_API_KEY if this host is reachable "
+              f"beyond a fully trusted LAN.")
+    else:
+        print("  API key: disabled (bound to loopback only)")
 
     # Store the --skip-warmup flag on app.state so the startup hook can
     # read it without a module-level global. The startup hook fires only
