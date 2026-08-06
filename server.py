@@ -21,17 +21,21 @@ import os
 # run a separation. Set BEFORE `import torch` so the allocator picks
 # it up at process start.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import ipaddress
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import traceback
 import threading
 import time
+import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from pathlib import Path
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
@@ -84,6 +88,28 @@ CACHE_DIR = Path(os.environ.get(
     Path.home() / ".cache" / "slopsmith-demucs",
 ))
 MAX_CONCURRENT = 2
+
+# /separate, /align and /pitch each do `content = await file.read()` and hold the whole
+# upload as an in-memory bytes object (unlike /transcribe, which streams to disk for
+# exactly this reason — see the comment on its handler). Nothing upstream caps request
+# body size, these endpoints have no auth requirement unless an operator sets an API key,
+# and this server is routinely exposed on a LAN — so a single oversized POST can OOM the
+# process. Cap it and reject anything larger with 413 rather than buffering it.
+try:
+    MAX_UPLOAD_MB = max(1, int(os.environ.get("SLOPSMITH_MAX_UPLOAD_MB", "300")))
+except (TypeError, ValueError):
+    MAX_UPLOAD_MB = 300
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile) -> bytes:
+    """Read an UploadFile's full body, raising ValueError instead of buffering past
+    MAX_UPLOAD_BYTES. `UploadFile.read(n)` reads at most n bytes, so this never holds
+    more than MAX_UPLOAD_BYTES + 1 bytes in memory even for a much larger upload."""
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"file exceeds the {MAX_UPLOAD_MB} MB upload limit")
+    return content
 
 # A Whisper segment must be LONGER than this to be aligned — the comparison is a strict `>`, so
 # a segment of exactly this duration is dropped too. wav2vec2 tends to return empty alignments
@@ -457,7 +483,12 @@ async def separate_upload(
 
     # Save upload to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "audio.mp3").suffix)
-    content = await file.read()
+    try:
+        content = await _read_upload_capped(file)
+    except ValueError as e:
+        tmp.close()
+        os.unlink(tmp.name)
+        return JSONResponse({"error": str(e)}, 413)
     tmp.write(content)
     tmp.close()
 
@@ -483,6 +514,73 @@ async def separate_upload(
 
 
 # ── Separation via URL ──────────────────────────────────────────────────
+#
+# /separate-url has the server fetch a caller-supplied URL itself, which
+# makes it a textbook SSRF vector unless the target is restricted: without
+# the checks below, a caller could point it at http://169.254.169.254/...
+# (cloud instance metadata), http://127.0.0.1:<internal-port>/..., an
+# RFC1918 LAN address, or a file:// / other non-http(s) scheme, and have
+# THIS server make that request/read on the caller's behalf. See
+# _validate_separate_url() and _NoRedirectHandler below.
+
+def _resolves_to_public_ip(hostname: str) -> bool:
+    """True if every address `hostname` resolves to is a public, routable
+    address — not loopback/private/link-local/reserved/multicast.
+
+    Checked at request time (not connect time), so this narrows but does
+    not eliminate a DNS-rebinding race; disabling redirects (below) closes
+    the other common bypass, where an allowed external host 302s to an
+    internal target after the initial check passes.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        raw_ip = info[4][0].split("%")[0]  # strip IPv6 zone id, if any
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            return False
+        mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
+        for candidate in (ip, mapped) if mapped else (ip,):
+            if (
+                candidate.is_private or candidate.is_loopback
+                or candidate.is_link_local or candidate.is_reserved
+                or candidate.is_multicast or candidate.is_unspecified
+            ):
+                return False
+    return True
+
+
+def _validate_separate_url(url: str) -> str | None:
+    """Return an error string if `url` is unsafe for the server to fetch,
+    else None. Restricts to http/https (blocking file://, ftp://, gopher://,
+    data:, ...) and rejects hosts that resolve to a non-public address."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "invalid url"
+    if parsed.scheme not in ("http", "https"):
+        return "url must be http:// or https://"
+    hostname = parsed.hostname
+    if not hostname:
+        return "url must include a host"
+    if not _resolves_to_public_ip(hostname):
+        return "url host is not allowed"
+    return None
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects. Without this, a URL that passes
+    _validate_separate_url()'s check against an allowed public host could
+    302 the fetch onward to an internal address, bypassing the check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 
 @app.post("/separate-url")
 async def separate_url(
@@ -493,6 +591,10 @@ async def separate_url(
     url = data.get("url", "").strip()
     if not url:
         return JSONResponse({"error": "url required"}, 400)
+
+    invalid_reason = _validate_separate_url(url)
+    if invalid_reason:
+        return JSONResponse({"error": f"Refusing to fetch url: {invalid_reason}"}, 400)
 
     use_model = model or _model
     stem_list = [s.strip() for s in stems.split(",") if s.strip()]
@@ -506,12 +608,16 @@ async def separate_url(
     if cached:
         return {"job_id": job_id, "stems": cached, "cached": True}
 
-    # Download the file first
-    import urllib.request
+    # Download the file first. Redirects are disabled (see _NoRedirectHandler) so a
+    # validated external URL can't hop to an internal target after the check above.
+    opener = urllib.request.build_opener(_NoRedirectHandler)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     try:
-        urllib.request.urlretrieve(url, tmp.name)
+        with opener.open(url, timeout=30) as resp:
+            shutil.copyfileobj(resp, tmp)
+        tmp.close()
     except Exception as e:
+        tmp.close()
         os.unlink(tmp.name)
         return JSONResponse({"error": f"Failed to download audio: {e}"}, 400)
 
@@ -873,7 +979,12 @@ async def align_lyrics(
         )
     # Save upload to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "audio.ogg").suffix)
-    content = await file.read()
+    try:
+        content = await _read_upload_capped(file)
+    except ValueError as e:
+        tmp.close()
+        os.unlink(tmp.name)
+        return JSONResponse({"error": str(e)}, 413)
     tmp.write(content)
     tmp.close()
 
@@ -1709,7 +1820,12 @@ async def pitch_extract(
 
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    content = await file.read()
+    try:
+        content = await _read_upload_capped(file)
+    except ValueError as e:
+        tmp.close()
+        os.unlink(tmp.name)
+        return JSONResponse({"error": str(e)}, 413)
     tmp.write(content)
     tmp.close()
 
