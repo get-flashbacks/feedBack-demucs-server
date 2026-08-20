@@ -21,17 +21,21 @@ import os
 # run a separation. Set BEFORE `import torch` so the allocator picks
 # it up at process start.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import ipaddress
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import traceback
 import threading
 import time
+import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from pathlib import Path
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
@@ -79,11 +83,42 @@ def _parse_cache_max_completed_jobs(value: str | None) -> int:
 DEMUCS_MODEL = os.environ.get("SLOPSMITH_DEMUCS_MODEL", "htdemucs_ft")
 DEMUCS_DEVICE = os.environ.get("SLOPSMITH_DEMUCS_DEVICE", "")
 API_KEY = os.environ.get("SLOPSMITH_API_KEY", "")
+# Origins allowed to read responses from a browser (CORS is a browser-enforced,
+# response-blocking control — it doesn't stop a raw server-to-server request).
+# Left at "*" by default because a self-hosted feedBack instance's own origin is
+# not knowable ahead of time (arbitrary LAN IP/hostname, arbitrary port) — the
+# same reasoning SLOPSMITH_API_KEY defaults empty for. Operators who want this
+# locked to their known feedBack origin(s) can set a comma-separated list here.
+CORS_ORIGINS = [
+    o.strip() for o in os.environ.get("SLOPSMITH_CORS_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
 CACHE_DIR = Path(os.environ.get(
     "SLOPSMITH_DEMUCS_CACHE",
     Path.home() / ".cache" / "slopsmith-demucs",
 ))
 MAX_CONCURRENT = 2
+
+# /separate, /align and /pitch each do `content = await file.read()` and hold the whole
+# upload as an in-memory bytes object (unlike /transcribe, which streams to disk for
+# exactly this reason — see the comment on its handler). Nothing upstream caps request
+# body size, these endpoints have no auth requirement unless an operator sets an API key,
+# and this server is routinely exposed on a LAN — so a single oversized POST can OOM the
+# process. Cap it and reject anything larger with 413 rather than buffering it.
+try:
+    MAX_UPLOAD_MB = max(1, int(os.environ.get("SLOPSMITH_MAX_UPLOAD_MB", "300")))
+except (TypeError, ValueError):
+    MAX_UPLOAD_MB = 300
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile) -> bytes:
+    """Read an UploadFile's full body, raising ValueError instead of buffering past
+    MAX_UPLOAD_BYTES. `UploadFile.read(n)` reads at most n bytes, so this never holds
+    more than MAX_UPLOAD_BYTES + 1 bytes in memory even for a much larger upload."""
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"file exceeds the {MAX_UPLOAD_MB} MB upload limit")
+    return content
 
 # A Whisper segment must be LONGER than this to be aligned — the comparison is a strict `>`, so
 # a segment of exactly this duration is dropped too. wav2vec2 tends to return empty alignments
@@ -117,6 +152,27 @@ def _normalized_language(language: str) -> str:
     if not re.fullmatch(r"[a-z]{2,8}", lang):
         raise ValueError(f"Invalid language code: {lang!r}")
     return lang
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True if binding to `host` only accepts connections from this machine.
+
+    A literal string comparison against ("127.0.0.1", "localhost", "::1")
+    misses equally-valid loopback spellings: any address in 127.0.0.0/8
+    (not just .1), IPv6 loopback written without :: compression
+    (0:0:0:0:0:0:0:1), or a bracketed IPv6 literal ([::1]). Parse it
+    properly instead. "localhost" is treated as loopback by convention
+    (matching every other tool's behavior) without a DNS lookup, since
+    resolving it is unreliable/slow and it means loopback on any sane
+    system's /etc/hosts.
+    """
+    if host == "localhost":
+        return True
+    candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False  # not a bare IP literal (0.0.0.0, a hostname, etc.) -> not loopback
 
 
 def _client_safe_error(e: Exception, where: str) -> str:
@@ -297,7 +353,7 @@ def _job_id_for(audio_hash: str, model: str) -> str:
 app = FastAPI(title="Slopsmith Demucs Server")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -457,7 +513,12 @@ async def separate_upload(
 
     # Save upload to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "audio.mp3").suffix)
-    content = await file.read()
+    try:
+        content = await _read_upload_capped(file)
+    except ValueError as e:
+        tmp.close()
+        os.unlink(tmp.name)
+        return JSONResponse({"error": str(e)}, 413)
     tmp.write(content)
     tmp.close()
 
@@ -483,6 +544,73 @@ async def separate_upload(
 
 
 # ── Separation via URL ──────────────────────────────────────────────────
+#
+# /separate-url has the server fetch a caller-supplied URL itself, which
+# makes it a textbook SSRF vector unless the target is restricted: without
+# the checks below, a caller could point it at http://169.254.169.254/...
+# (cloud instance metadata), http://127.0.0.1:<internal-port>/..., an
+# RFC1918 LAN address, or a file:// / other non-http(s) scheme, and have
+# THIS server make that request/read on the caller's behalf. See
+# _validate_separate_url() and _NoRedirectHandler below.
+
+def _resolves_to_public_ip(hostname: str) -> bool:
+    """True if every address `hostname` resolves to is a public, routable
+    address — not loopback/private/link-local/reserved/multicast.
+
+    Checked at request time (not connect time), so this narrows but does
+    not eliminate a DNS-rebinding race; disabling redirects (below) closes
+    the other common bypass, where an allowed external host 302s to an
+    internal target after the initial check passes.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        raw_ip = info[4][0].split("%")[0]  # strip IPv6 zone id, if any
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            return False
+        mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
+        for candidate in (ip, mapped) if mapped else (ip,):
+            if (
+                candidate.is_private or candidate.is_loopback
+                or candidate.is_link_local or candidate.is_reserved
+                or candidate.is_multicast or candidate.is_unspecified
+            ):
+                return False
+    return True
+
+
+def _validate_separate_url(url: str) -> str | None:
+    """Return an error string if `url` is unsafe for the server to fetch,
+    else None. Restricts to http/https (blocking file://, ftp://, gopher://,
+    data:, ...) and rejects hosts that resolve to a non-public address."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "invalid url"
+    if parsed.scheme not in ("http", "https"):
+        return "url must be http:// or https://"
+    hostname = parsed.hostname
+    if not hostname:
+        return "url must include a host"
+    if not _resolves_to_public_ip(hostname):
+        return "url host is not allowed"
+    return None
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects. Without this, a URL that passes
+    _validate_separate_url()'s check against an allowed public host could
+    302 the fetch onward to an internal address, bypassing the check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 
 @app.post("/separate-url")
 async def separate_url(
@@ -493,6 +621,10 @@ async def separate_url(
     url = data.get("url", "").strip()
     if not url:
         return JSONResponse({"error": "url required"}, 400)
+
+    invalid_reason = _validate_separate_url(url)
+    if invalid_reason:
+        return JSONResponse({"error": f"Refusing to fetch url: {invalid_reason}"}, 400)
 
     use_model = model or _model
     stem_list = [s.strip() for s in stems.split(",") if s.strip()]
@@ -506,12 +638,16 @@ async def separate_url(
     if cached:
         return {"job_id": job_id, "stems": cached, "cached": True}
 
-    # Download the file first
-    import urllib.request
+    # Download the file first. Redirects are disabled (see _NoRedirectHandler) so a
+    # validated external URL can't hop to an internal target after the check above.
+    opener = urllib.request.build_opener(_NoRedirectHandler)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     try:
-        urllib.request.urlretrieve(url, tmp.name)
+        with opener.open(url, timeout=30) as resp:
+            shutil.copyfileobj(resp, tmp)
+        tmp.close()
     except Exception as e:
+        tmp.close()
         os.unlink(tmp.name)
         return JSONResponse({"error": f"Failed to download audio: {e}"}, 400)
 
@@ -873,7 +1009,12 @@ async def align_lyrics(
         )
     # Save upload to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "audio.ogg").suffix)
-    content = await file.read()
+    try:
+        content = await _read_upload_capped(file)
+    except ValueError as e:
+        tmp.close()
+        os.unlink(tmp.name)
+        return JSONResponse({"error": str(e)}, 413)
     tmp.write(content)
     tmp.close()
 
@@ -1274,7 +1415,7 @@ async def align_lyrics(
             # their own mistakes from server faults.
             return {"error": str(e), "_http_status": 400}
         except Exception as e:
-            return {"error": str(e)}
+            return {"error": _client_safe_error(e, "align")}
         finally:
             try:
                 os.unlink(tmp.name)
@@ -1709,7 +1850,12 @@ async def pitch_extract(
 
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    content = await file.read()
+    try:
+        content = await _read_upload_capped(file)
+    except ValueError as e:
+        tmp.close()
+        os.unlink(tmp.name)
+        return JSONResponse({"error": str(e)}, 413)
     tmp.write(content)
     tmp.close()
 
@@ -1717,7 +1863,7 @@ async def pitch_extract(
         try:
             return {"notes": _extract_pitch_with_crepe(Path(tmp.name), token_list)}
         except Exception as exc:  # noqa: BLE001
-            return {"error": str(exc)}
+            return {"error": _client_safe_error(exc, "pitch")}
         finally:
             try:
                 os.unlink(tmp.name)
@@ -2149,7 +2295,7 @@ def _run_demucs(job_id, audio_path, stem_list, model):
         proc.kill()
         _update_job(job_id, status="failed", error="Separation timed out (10 min limit)")
     except Exception as e:
-        _update_job(job_id, status="failed", error=str(e))
+        _update_job(job_id, status="failed", error=_client_safe_error(e, "separate (demucs)"))
     finally:
         with active_lock:
             active_count -= 1
@@ -2261,7 +2407,7 @@ def _run_roformer(job_id, audio_path, stem_list, model):
             proc.kill()
         _update_job(job_id, status="failed", error="Separation timed out (30 min limit)")
     except Exception as e:
-        _update_job(job_id, status="failed", error=str(e))
+        _update_job(job_id, status="failed", error=_client_safe_error(e, "separate (roformer)"))
     finally:
         with active_lock:
             active_count -= 1
@@ -2547,6 +2693,20 @@ def main():
               f"entr{'y' if _pruned_at_startup == 1 else 'ies'} over the limit at startup")
     if API_KEY:
         print("  API key: enabled")
+    elif not _is_loopback_host(args.host):
+        # Every endpoint — including GPU/CPU-heavy separation and job-status
+        # routes — is reachable unauthenticated by anything that can reach
+        # this host when no key is set. Loud by design: this is the single
+        # highest-impact misconfiguration for this server, and it's silent
+        # otherwise (see feedBack-demucs-server issue "No auth by default
+        # on GPU/CPU-heavy endpoints").
+        print(f"  WARNING: no API key configured and server is bound to "
+              f"{args.host} (not loopback-only) — every endpoint is reachable "
+              f"unauthenticated by anything that can reach this host. Set "
+              f"--api-key or SLOPSMITH_API_KEY if this host is reachable "
+              f"beyond a fully trusted LAN.")
+    else:
+        print("  API key: disabled (bound to loopback only)")
 
     # Store the --skip-warmup flag on app.state so the startup hook can
     # read it without a module-level global. The startup hook fires only
