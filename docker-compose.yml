@@ -83,7 +83,17 @@ services:
     #
     # (`gpus:` is the modern spelling. The old `runtime: nvidia` still works on
     # some setups but is deprecated.)
-    # gpus: all
+    gpus: all
+
+    # Joins feedBack's own compose network so the feedback-web-1 container
+    # can reach this one by container name (http://feedback-demucs-server:7865)
+    # instead of needing a host-mapped address like host.docker.internal.
+    networks:
+      - feedback_default
+
+networks:
+  feedback_default:
+    external: true
 
 volumes:
   demucs-cache:
